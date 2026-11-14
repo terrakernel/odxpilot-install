@@ -20,14 +20,16 @@
 # shellcheck disable=SC2153
 set -Eeuo pipefail
 
-INSTALLER_VERSION="0.1.0"
-BUNDLE_VERSION="0.1.0"
+INSTALLER_VERSION="0.1.1"
+BUNDLE_VERSION="0.1.1"
 BUNDLE_URL="https://github.com/terrakernel/odxpilot-install/releases/download/v${BUNDLE_VERSION}/odxpilot-bundle-${BUNDLE_VERSION}.tar.gz"
 
 MODEL_URL="https://huggingface.co/terrakernel/odxbrain-bge-m3-gguf/resolve/582d13afe777ea05e979a07890d6b3e6ae8dd975/bge-m3-f16.gguf"
 MODEL_SHA256="1257ef7bb76105793f89307b02d6b9c29a444d629f9ff0ad56ee023222fa105d"
 PACK_VERSION="2026.09.4"
 PACK_URL="https://github.com/terrakernel/odxbrain-corpus/releases/download/${PACK_VERSION}/odxbrain-pack-${PACK_VERSION}-bge-m3.tar.gz"
+# Pinned here, not read from the release, so a replaced release asset can't pass
+PACK_SHA256="d7dc6842e9c84ccc25d09379444e334a80ff2597df3a770a21c702209b40ce78"
 
 # ---- output ------------------------------------------------------------------------------------
 
@@ -800,8 +802,7 @@ download_brain_files() {
         local tmp
         tmp=$(mktemp -d)
         curl -fsSL -o "$tmp/pack.tar.gz" "$PACK_URL" || die "can't download the corpus pack"
-        curl -fsSL -o "$tmp/pack.sha256" "$PACK_URL.sha256" || die "can't download the pack's checksum"
-        [ "$(sha256_of "$tmp/pack.tar.gz")" = "$(cut -d' ' -f1 <"$tmp/pack.sha256")" ] || die "the corpus pack's checksum doesn't match"
+        [ "$(sha256_of "$tmp/pack.tar.gz")" = "$PACK_SHA256" ] || die "the corpus pack's checksum doesn't match"
         rm -rf "$DIR/pack" && mkdir -p "$DIR/pack" && tar xzf "$tmp/pack.tar.gz" -C "$DIR/pack"
         chmod 755 "$DIR/pack" && chmod 644 "$DIR/pack/"*
         rm -rf "$tmp"
