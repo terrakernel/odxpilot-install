@@ -20,8 +20,8 @@
 # shellcheck disable=SC2153
 set -Eeuo pipefail
 
-INSTALLER_VERSION="0.1.2"
-BUNDLE_VERSION="0.1.2"
+INSTALLER_VERSION="0.1.3"
+BUNDLE_VERSION="0.1.3"
 BUNDLE_URL="https://github.com/terrakernel/odxpilot-install/releases/download/v${BUNDLE_VERSION}/odxpilot-bundle-${BUNDLE_VERSION}.tar.gz"
 
 MODEL_URL="https://huggingface.co/terrakernel/odxbrain-bge-m3-gguf/resolve/582d13afe777ea05e979a07890d6b3e6ae8dd975/bge-m3-f16.gguf"
@@ -397,6 +397,11 @@ choose_dir() {
     fi
 }
 
+# The image tags come from the bundle (its .env.example), so a release changes them in one place.
+bundle_tag() { # NAME
+    env_get "$DIR/examples/.env.example" "$1"
+}
+
 fetch_bundle() {
     step "Getting the compose bundle"
     local src=${BUNDLE:-$BUNDLE_URL} tmp
@@ -433,6 +438,10 @@ fetch_bundle() {
         cp -R "$tmp/policies" "$DIR/policies"
     fi
     rm -rf "$tmp"
+    local name
+    for name in ODXPILOT_TAG ODXPROXY_TAG ODXBRAIN_TAG ODXDOCS_TAG; do
+        [ -n "$(bundle_tag "$name")" ] || die "the bundle's .env.example names no $name"
+    done
     ok "compose.yaml and examples in $DIR"
 }
 
@@ -683,10 +692,10 @@ write_files() {
         say "# Written by the ODXPilot installer $INSTALLER_VERSION. No keys here: they are in env/."
         say "COMPOSE_PROJECT_NAME=$(basename "$DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
         say "COMPOSE_PROFILES=${profiles#,}"
-        say "ODXPILOT_TAG=${ODXPILOT_TAG:-0.1.0}"
-        say "ODXPROXY_TAG=${ODXPROXY_TAG:-0.10.1}"
-        say "ODXBRAIN_TAG=${ODXBRAIN_TAG:-0.1.0}"
-        say "ODXDOCS_TAG=${ODXDOCS_TAG:-0.1.0}"
+        say "ODXPILOT_TAG=${ODXPILOT_TAG:-$(bundle_tag ODXPILOT_TAG)}"
+        say "ODXPROXY_TAG=${ODXPROXY_TAG:-$(bundle_tag ODXPROXY_TAG)}"
+        say "ODXBRAIN_TAG=${ODXBRAIN_TAG:-$(bundle_tag ODXBRAIN_TAG)}"
+        say "ODXDOCS_TAG=${ODXDOCS_TAG:-$(bundle_tag ODXDOCS_TAG)}"
         say "ODXPILOT_BIND=${ODXPILOT_BIND:-127.0.0.1}"
         say "ODXPILOT_PORT=$ODXPILOT_PORT"
         say "PROXY_BIND=${PROXY_BIND:-127.0.0.1}"
@@ -799,10 +808,18 @@ check_ports() {
     [ -z "$busy" ] || die "already in use on this machine:$busy. Free them, or rerun with other ports, e.g. ODXPILOT_PORT=8701"
 }
 
+model_current() {
+    [ -f "$DIR/models/bge-m3-f16.gguf" ] && [ "$(sha256_of "$DIR/models/bge-m3-f16.gguf")" = "$MODEL_SHA256" ]
+}
+
+pack_current() {
+    [ -f "$DIR/pack/manifest.json" ] && grep -q "\"corpus_version\": *\"$PACK_VERSION\"" "$DIR/pack/manifest.json"
+}
+
 download_brain_files() {
     step "ODXBrain's model and corpus"
     local model="$DIR/models/bge-m3-f16.gguf"
-    if [ -f "$model" ] && [ "$(sha256_of "$model")" = "$MODEL_SHA256" ]; then
+    if model_current; then
         ok "model already there"
     else
         note "downloading the model (1.2 GB, resumes if cut)"
@@ -812,7 +829,7 @@ download_brain_files() {
         ok "model (checksum matches)"
     fi
     chmod 644 "$model"
-    if [ -f "$DIR/pack/manifest.json" ] && grep -q "\"corpus_version\": *\"$PACK_VERSION\"" "$DIR/pack/manifest.json"; then
+    if pack_current; then
         ok "corpus pack $PACK_VERSION already there"
     else
         local tmp
@@ -1011,6 +1028,94 @@ summary() {
     say ""
 }
 
+# ---- upgrade -----------------------------------------------------------------------------------
+# Keeps the parts, ports, settings and keys; takes the new bundle's image tags and any setting it
+# adds, the model and pack this installer pins, and starts everything as an install would.
+
+env_set() { # FILE KEY VALUE: replace the KEY= line, or add one
+    local tmp="$1.tmp.$$"
+    awk -v k="$2" -v v="$3" 'index($0, k "=") == 1 { print k "=" v; done = 1; next } { print }
+        END { if (!done) print k "=" v }' "$1" >"$tmp"
+    cat "$tmp" >"$1"
+    rm -f "$tmp"
+}
+
+upgrade_env() {
+    local f="$DIR/.env" name old new line key changed=0
+    for name in ODXPILOT_TAG ODXPROXY_TAG ODXBRAIN_TAG ODXDOCS_TAG; do
+        new=${!name:-$(bundle_tag "$name")}
+        old=$(env_get "$f" "$name")
+        if [ "$old" != "$new" ]; then
+            env_set "$f" "$name" "$new"
+            ok "$name ${old:-(none)} -> $new"
+            changed=1
+        fi
+    done
+    # a setting the new bundle adds: its default, but this machine's own user
+    while IFS= read -r line; do
+        case "$line" in [A-Z]*=*) ;; *) continue ;; esac
+        key=${line%%=*}
+        grep -q "^$key=" "$f" && continue
+        case "$key" in
+            ODX_UID) new=$(id -u) ;;
+            ODX_GID) new=$(id -g) ;;
+            *) new=${line#*=} ;;
+        esac
+        env_set "$f" "$key" "$new"
+        ok "$key=$new (a new setting)"
+        changed=1
+    done <"$DIR/examples/.env.example"
+    [ "$changed" = 1 ] || ok "image tags and settings already current"
+}
+
+upgrade() {
+    local parts brain_files=0
+    parts=$(env_get "$DIR/.install" PARTS)
+    [ -n "$parts" ] || die "$DIR/.install doesn't say which parts run here: choose reconfigure instead"
+    PARTS=$parts; PILOT=0; PROXY=0; BRAIN=0
+    case ",$parts," in *,pilot,*) PILOT=1 ;; esac
+    case ",$parts," in *,proxy,*) PROXY=1 ;; esac
+    case ",$parts," in *,brain,*) BRAIN=1 ;; esac
+    [ "$BRAIN" = 1 ] && check_brain_docker
+    fetch_bundle
+
+    step "Upgrading the settings (parts, ports and keys stay)"
+    upgrade_env
+    ODXPILOT_PORT=$(env_get "$DIR/.env" ODXPILOT_PORT); ODXPILOT_PORT=${ODXPILOT_PORT:-8700}
+    PROXY_PORT=$(env_get "$DIR/.env" PROXY_PORT); PROXY_PORT=${PROXY_PORT:-6600}
+    BRAIN_PORT=$(env_get "$DIR/.env" BRAIN_PORT); BRAIN_PORT=${BRAIN_PORT:-8080}
+    SOP_EDITOR_PORT=$(env_get "$DIR/.env" SOP_EDITOR_PORT); SOP_EDITOR_PORT=${SOP_EDITOR_PORT:-8091}
+    # A service this version adds needs its port free (the running ones hold their own)
+    if [ "$BRAIN" = 1 ] && [ -z "$(compose ps -q sop-editor 2>/dev/null)" ] && port_busy "$SOP_EDITOR_PORT"; then
+        die "port $SOP_EDITOR_PORT, for the SOP editor this version adds, is in use on this machine. Free it, or set SOP_EDITOR_PORT in $DIR/.env to a free port, and upgrade again"
+    fi
+
+    step "Pulling the images"
+    quietly pull || die "couldn't pull the new images (above)"
+    ok "images"
+    if [ "$BRAIN" = 1 ] && ! { model_current && pack_current; }; then
+        # ODXBrain refuses a pack that doesn't match its model: swap both while it's stopped. The
+        # SOP snapshot is text only (ODXBrain embeds it at load), so it stays as it is.
+        brain_files=1
+        quietly stop odxbrain || true
+        download_brain_files
+    fi
+
+    if [ "$BRAIN" = 1 ]; then start_brain; fi
+    if [ "$PROXY" = 1 ]; then start_proxy; fi
+    if [ "$PILOT" = 1 ]; then start_pilot; fi
+
+    step "Upgraded to $BUNDLE_VERSION"
+    if [ "$brain_files" = 1 ]; then
+        say "  Parts, ports and keys unchanged; ODXBrain has the new model and corpus."
+    else
+        say "  Parts, ports and keys unchanged."
+    fi
+    [ "$PILOT" = 1 ] && say "  ODXPilot: http://127.0.0.1:$ODXPILOT_PORT/"
+    [ "$BRAIN" = 1 ] && say "  The SOP editor: http://127.0.0.1:$SOP_EDITOR_PORT/ (this machine only)"
+    true
+}
+
 main() {
     local arg
     while [ $# -gt 0 ]; do
@@ -1046,12 +1151,7 @@ main() {
     choose_dir
 
     if [ "$ACTION" = upgrade ]; then
-        case ",$(env_get "$DIR/.install" PARTS)," in *,brain,*) check_brain_docker ;; esac
-        fetch_bundle
-        step "Upgrading"
-        quietly pull || die "couldn't pull the new images (above)"
-        quietly up -d || die "couldn't start the upgraded stack (above)"
-        ok "upgraded; settings and keys unchanged"
+        upgrade
         exit 0
     fi
 
