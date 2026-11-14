@@ -31,11 +31,13 @@ It checks the machine, asks a few questions, generates the keys between the part
 stored in files only you can read), downloads ODXBrain's model and corpus pack and checks them
 against their SHA-256, starts everything and checks it end to end. A machine whose parts others
 connect to writes a hand-over file with its address and keys, which the installer on the next
-machine reads. Run it again to upgrade or reconfigure.
+machine reads. Run it again to upgrade or reconfigure. Where the brain runs, the SOP editor is
+at http://127.0.0.1:8091/ (that machine only; from another one, through an SSH tunnel).
 
 ## What you need
 
-- Docker with Compose 2.20 or newer, on Linux or macOS (Windows: WSL 2).
+- Docker with Compose 2.20 or newer (2.35 and Docker Engine 28 or newer where the brain runs), on
+  Linux or macOS (Windows: WSL 2).
 - For the proxy: an ODXProxy licence (`license.json`) from [odxproxy.io](https://odxproxy.io).
 - For the pilot: your Odoo's address and database, an Odoo user with an API key, and an LLM key
   (OpenAI, Anthropic, Google Vertex AI) or your own OpenAI-compatible server.

@@ -20,8 +20,8 @@
 # shellcheck disable=SC2153
 set -Eeuo pipefail
 
-INSTALLER_VERSION="0.1.1"
-BUNDLE_VERSION="0.1.1"
+INSTALLER_VERSION="0.1.2"
+BUNDLE_VERSION="0.1.2"
 BUNDLE_URL="https://github.com/terrakernel/odxpilot-install/releases/download/v${BUNDLE_VERSION}/odxpilot-bundle-${BUNDLE_VERSION}.tar.gz"
 
 MODEL_URL="https://huggingface.co/terrakernel/odxbrain-bge-m3-gguf/resolve/582d13afe777ea05e979a07890d6b3e6ae8dd975/bge-m3-f16.gguf"
@@ -296,7 +296,7 @@ compose() {
     (cd "$DIR" && env -u COMPOSE_PROFILES -u COMPOSE_PROJECT_NAME -u COMPOSE_FILE \
         -u ODXPILOT_TAG -u ODXPROXY_TAG -u ODXBRAIN_TAG -u ODXDOCS_TAG \
         -u ODXPILOT_BIND -u ODXPILOT_PORT -u PROXY_BIND -u PROXY_PORT -u BRAIN_BIND -u BRAIN_PORT \
-        -u DOCS_BIND -u DOCS_PORT -u ODX_UID -u ODX_GID docker compose "$@")
+        -u DOCS_BIND -u DOCS_PORT -u SOP_EDITOR_PORT -u ODX_UID -u ODX_GID docker compose "$@")
 }
 
 # hand-over files: KEY=value lines another machine's install wrote
@@ -358,7 +358,9 @@ preflight() {
     case "$cv" in
         1.* | 2.[0-9].* | 2.1[0-9].*) die "Docker Compose $cv is too old: 2.20 or newer is needed" ;;
     esac
-    ok "Docker $(docker version --format '{{.Server.Version}}' 2>/dev/null), Compose $cv"
+    COMPOSE_VERSION=$cv
+    ENGINE_VERSION=$(docker version --format '{{.Server.Version}}' 2>/dev/null || true)
+    ok "Docker $ENGINE_VERSION, Compose $cv"
     have curl || die "curl is needed"
     have tar || die "tar is needed"
     if [ "$ARCH" = aarch64 ] || [ "$ARCH" = arm64 ]; then
@@ -460,6 +462,18 @@ ask_parts() {
     PARTS=$parts
     [ -n "$PARTS" ] || die "nothing to install: choose at least one part"
     ok "this machine runs: $PARTS"
+    [ "$BRAIN" = 1 ] && check_brain_docker
+    return 0
+}
+
+# The SOP editor (brain) runs the odxdocs binary from its image: an image volume
+check_brain_docker() {
+    case "$COMPOSE_VERSION" in
+        2.2[0-9].* | 2.3[0-4].*) die "Docker Compose $COMPOSE_VERSION is too old for the brain: 2.35 or newer is needed (Docker Desktop: update it)" ;;
+    esac
+    case "$ENGINE_VERSION" in
+        1[0-9].* | 2[0-7].*) die "Docker $ENGINE_VERSION is too old for the brain: 28 or newer is needed" ;;
+    esac
 }
 
 network_warning() { # WHAT
@@ -681,6 +695,7 @@ write_files() {
         say "BRAIN_PORT=$BRAIN_PORT"
         say "DOCS_BIND=${BRAIN_BIND:-127.0.0.1}"
         say "DOCS_PORT=$DOCS_PORT"
+        say "SOP_EDITOR_PORT=$SOP_EDITOR_PORT"
         say "ODX_UID=$(id -u)"
         say "ODX_GID=$(id -g)"
     } >"$DIR/.env"
@@ -780,6 +795,7 @@ check_ports() {
     [ "$PROXY" = 1 ] && port_busy "$PROXY_PORT" && busy="$busy $PROXY_PORT (ODXProxy, PROXY_PORT)"
     [ "$BRAIN" = 1 ] && port_busy "$BRAIN_PORT" && busy="$busy $BRAIN_PORT (ODXBrain, BRAIN_PORT)"
     [ "$BRAIN" = 1 ] && port_busy "$DOCS_PORT" && busy="$busy $DOCS_PORT (odxdocs, DOCS_PORT)"
+    [ "$BRAIN" = 1 ] && port_busy "$SOP_EDITOR_PORT" && busy="$busy $SOP_EDITOR_PORT (the SOP editor, SOP_EDITOR_PORT)"
     [ -z "$busy" ] || die "already in use on this machine:$busy. Free them, or rerun with other ports, e.g. ODXPILOT_PORT=8701"
 }
 
@@ -928,6 +944,11 @@ start_brain() {
             warn "publishing the SOPs failed: docker compose run --rm publish (in $DIR) shows why"
         fi
     fi
+    if quietly up -d $RECREATE sop-editor && wait_http "http://127.0.0.1:$SOP_EDITOR_PORT/" 60; then
+        ok "SOP editor on http://127.0.0.1:$SOP_EDITOR_PORT/"
+    else
+        warn "the SOP editor didn't start: docker compose logs sop-editor (in $DIR) shows why"
+    fi
 }
 
 start_proxy() {
@@ -971,6 +992,11 @@ summary() {
         say "    \"Which customer invoices are still unpaid?\""
         [ "$ROLE" = contact_editor ] && [ -n "$P_DOCS_URL" ] && say "    \"Create a new contact for ACME Research, Germany, info@acme.example\" (then Approve)"
     fi
+    if [ "$BRAIN" = 1 ]; then
+        say ""
+        say "  ${B}Your SOPs${RST}: write and publish them in the SOP editor, http://127.0.0.1:$SOP_EDITOR_PORT/"
+        say "    (this machine only; from another one: ssh -L $SOP_EDITOR_PORT:127.0.0.1:$SOP_EDITOR_PORT <this machine>)"
+    fi
     if [ -n "${HANDOVERS:-}" ]; then
         say ""
         say "  ${B}For the other machines${RST}: copy these files to them (they hold keys; delete them after):"
@@ -980,7 +1006,7 @@ summary() {
     say ""
     say "  Day to day (in $DIR):"
     say "    docker compose ps | logs -f odx-mcp | down | up -d"
-    [ "$BRAIN" = 1 ] && say "    docker compose run --rm publish     after editing sop-files/ (or: run --rm gui, the editor)"
+    [ "$BRAIN" = 1 ] && say "    docker compose run --rm publish     after editing the files in sop-files/ by hand"
     say "    rerun this installer to upgrade or reconfigure"
     say ""
 }
@@ -1006,6 +1032,7 @@ main() {
     PROXY_PORT=${PROXY_PORT:-6600}
     BRAIN_PORT=${BRAIN_PORT:-8080}
     DOCS_PORT=${DOCS_PORT:-8090}
+    SOP_EDITOR_PORT=${SOP_EDITOR_PORT:-8091}
     HANDOVERS=""
     IP=$(preset IP || true)
     LICENSE=""
@@ -1019,6 +1046,7 @@ main() {
     choose_dir
 
     if [ "$ACTION" = upgrade ]; then
+        case ",$(env_get "$DIR/.install" PARTS)," in *,brain,*) check_brain_docker ;; esac
         fetch_bundle
         step "Upgrading"
         quietly pull || die "couldn't pull the new images (above)"
